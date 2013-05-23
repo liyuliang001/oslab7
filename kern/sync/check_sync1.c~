@@ -1,0 +1,244 @@
+#include <stdio.h>
+#include <proc.h>
+#include <sem.h>
+#include <monitor.h>
+#include <assert.h>
+
+#define N 3 // The number of different films 
+#define SLEEP_TIME 100
+#define USER_NUM 20
+
+uint32_t seed1 = ticks;  //RNG seeds
+uint32_t seed2 = ticks + 12345;
+int id_num; //variable for allocate id for an user
+semaphore_t id_num_s;
+
+//---------- cinema problem using semaphore -----------------------
+semaphore_t film_s[N];  // semaphore for each film
+semaphore_t cinema_s;   // semaphore for the cinema
+semaphore_t current_s;  // semaphore for the current playing film
+semaphore_t wait_num_s[N]; // semaphore for the number of waiting users
+semaphore_t rand_s;     // semaphore for RNG
+int wait_num[N];     // the number of users waiting for film i
+int current;         // current playing film
+int tmp[N];          // A temporary array
+struct proc_struct *user_proc_sema[N];
+struct proc_struct *cinema_proc_sema;
+
+
+uint32_t myrand() {  //A simple random number generator
+   down(rand_s);
+   seed1 = 36969 * (seed1 & 65535) + (seed1 >> 16);
+   seed2 = 18000 * (seed2 & 65535) + (seed2 >> 16);
+   uint32_t re = (seed1 << 16) + seed2;
+   up(rand_s);
+   return re; 
+}
+
+void switch_film_sema() {
+     while (1) {
+        down(&current_s);           //Lock the variable current
+
+        int tot = 0;
+        int pre = current;
+        for (int i = 0; i < N; i++)
+           if (wait_num[i] > 0)
+              tmp[tot++] = i;      //Find all films for which there is someone waiting.
+
+        if (tot == 0) {            //No body is waiting.
+           current = -1;
+           cprintf("The cinema stops to play film since there is no waiting user.\n");
+           up(&current_s);
+        }
+        else {
+          current = tmp[myrand() % tot];  //Choose a random film for which there is users waiting.
+                                        //The reason to do this is to avoid the situation that 
+                                        //there is a film never playing.
+                                        //A better solution is choose a film according to some
+                                        //workload balance principle. 
+          cprintf("The cinema starts to play film %d from film %d.\n", current, pre);
+          up(&current_s);
+          up(&film_s[i]);
+        }
+        if (pre != -1)
+           up(&wait_num_s[pre]);
+        down(&cinema_s);
+    }
+}
+
+void try_to_watch_sema(int i) {
+     down(&wait_num_s[i]);
+     wait_num[i]++;
+     down(&current_s);
+     if (current == -1)
+        up(&cinema_s);
+     while (1) {
+        down(&current_s);
+        if (current == i) {
+           up(&current_s); 
+           break;
+        }
+        up(&current_s);
+        if (wait_num[i] == 1)
+           down(&flim_s[i]); //If the current playing film is not i, then waiting.
+     }   
+     up(&wait_num_s[i]);
+}
+
+void quit_watch_sema(int i) {
+     down(&wait_num_s[i]);
+     wait_num[i]--;
+     if (wait_num[i] == 0) {
+        up(&cinema_s);
+        down(&wait_num_s[i]);   //Lock the film i to avoid there is no switching occurs
+                                //And unlock it when a switching is done.
+     }
+     up(&wait_num_s[i]);
+}
+
+void watch_film_sema(int i)  {  // The process of the user id to watch film i
+     down(&id_num_s);
+     int id = id_num_s++;
+     up(&id_num_s);
+
+     try_to_watch_sema(i);
+
+     cprintf("The user %d is watching film %d.\n", id, i);
+     do_sleep(SLEEP_TIME);
+     cprintf("The user %d finishes watching film %d\n", id, i);
+
+     quit_watch_sema(i);
+}
+
+//-----------------cinema problem using monitor ------------
+monitor_t mt, *mtp=&mt;                          // monitor
+int current_monitor;
+int num_waiting_monitor[N];
+struct proc_struct *user_proc_monitor[N];
+struct proc_struct *cinema_proc_monitor;
+
+void switch_film_monitor() {
+while (1) {
+     down(&(mtp->mutex));    //Enter a monitor routine
+     int tot = 0;
+     int pre = current_monitor;
+     for (int i = 0; i < N; i++)
+         if (wait_num[i] > 0)
+            tmp[tot++] = i;      //Find all films for which there is someone wait
+     if (tot == 0) {            //No body is waiting.
+         current_monitor = -1;
+         cprintf("The cinema stops to play film since there is no waiting user.\n");
+     }
+     else {
+         current_monitor = tmp[myrand() % tot];  //Choose a random film for which there is users waiting.
+                                        //The reason to do this is to avoid the situation that 
+                                        //there is a film never playing.
+                                        //A better solution is choose a film according to some
+                                        //workload balance principle. 
+         cprintf("The cinema starts to play film %d from film %d.\n", current_monitor, pre);
+         cond_signal(&mtp->cv[i]);
+     }
+     if(mtp->next_count>0)   //Leave a monitor routine
+        up(&(mtp->next));
+     else
+        up(&(mtp->mutex));
+     cond_wait(&mtp->cv[N]);
+}
+}
+
+void try_to_watch_monitor(int id, int i)  {  // The user id want to watch film i
+     down(&(mtp->mutex));    //Enter a monitor routine
+     
+     num_waiting_monitor[i]++;
+
+     if (current_monitor == -1)     //No film is playing
+        cond_signal(mtp->cv[N]); //Wake the cinema process to allocate a new film
+
+     if (current_monitor != i)     
+        cond_wait(mtp->cv[i]);  //Wait if the current playing movie is not i
+    
+     if(mtp->next_count>0)   //Leave a monitor routine
+        up(&(mtp->next));
+     else
+        up(&(mtp->mutex));
+}
+
+void quit_watch_monitor() {
+    down(&(mtp->mutex));    //Enter a monitor routine
+    
+    num_waiting_monitor[i]--;
+    if (num_waiting_monitor[i] == 0) //Nobody is watching the current film
+       cond_signal(mtp->cv[N]); //Wake the cinema process to allocate a new film
+
+    if(mtp->next_count>0)   //Leave a monitor routine
+       up(&(mtp->next));
+    else
+       up(&(mtp->mutex));
+}
+
+void watch_film_monitor(int i)  {  // The process of the user id to watch film i
+     down(&id_num_s);
+     int id = id_num_s++;
+     up(&id_num_s);
+
+     try_to_watch_monitor(id, i);
+
+     cprintf("The user %d is watching film %d.\n", id, i);
+     do_sleep(SLEEP_TIME);
+     cprintf("The user %d finishes watching film %d\n", id, i);
+
+     quit_watch_monitor(i);
+}
+
+void check_sync(void){
+
+    int i;
+
+    sem_init(id_num_s, 1);
+    //check semaphore
+    id_num = 0;
+    sem_init(&cinema_s, 1);
+    sem_init(&current, 1);
+    sem_init(&rand_s, 1);
+    for (i = 0; i < N; i++) {
+       sem_init(&film_s[i], 1);
+       sem_init(&wait_num_s[i], 1);
+       wait_num[i] = 0;
+    }
+
+    int pid = kernel_thread(switch_film_sema, NULL, 0);
+    if (pid <= 0)
+       panic("create the cinema process with sema failed.\n");
+    cinema_proc_sema = find_proc(pid); 
+    set_proc_name(cinema_proc_sema, "cinema_sema_proc");
+
+    for (i = 0; i < USER_NUM; i++) {    
+        uint32_t t = rand() % N;  //a random film to watch
+        int pid = kernel_thread(watch_film_sema, (void *) t, 0);
+        if (pid <= 0) {
+            panic("create No.%d user with sema failed.\n", i);
+        }
+        user_proc_sema[i] = find_proc(pid);
+        set_proc_name(user_proc_sema[i], "user_sema_proc");
+    }
+
+    //check monitor
+    monitor_init(&mt, N + 1);
+    for (i = 0; i < N; i++)
+       num_waiting_monitor[i] = 0;
+    int pid = kernel_thread(switch_film_monitor, NULL, 0);
+    if (pid <= 0)
+       panic("create the cinema process with monitor failed.\n");
+    cinema_proc_monitor = find_proc(pid); 
+    set_proc_name(cinema_proc_monitor, "cinema_monitor_proc");
+
+    for(i=0;i<N;i++){
+        uint32_t t = rand() % N;  //a random film to watch
+        int pid = kernel_thread(watch_film_monitor, (void *) t, 0);
+        if (pid <= 0) {
+            panic("create No.%d user with monitor failed.\n", i);
+        }
+        user_proc_monitor[i] = find_proc(pid);
+        set_proc_name(user_proc_monitor[i], "user_monitor_proc");
+    }
+}
